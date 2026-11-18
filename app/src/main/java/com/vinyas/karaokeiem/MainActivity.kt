@@ -187,6 +187,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        viewModel.onAppResumed()
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<String>,
@@ -247,6 +252,10 @@ fun KaraokeScreen(
     val selectedBtId by viewModel.selectedBtId.collectAsState()
     val loadedFileName by viewModel.loadedFileName.collectAsState()
     val calState by viewModel.calibrationState.collectAsState()
+
+    var offsetSliderDraft by remember { mutableFloatStateOf(telemetry.btAdvanceMs.toFloat()) }
+    var isDraggingOffset by remember { mutableStateOf(false) }
+    val displayedOffsetMs = if (isDraggingOffset) offsetSliderDraft.roundToInt() else telemetry.btAdvanceMs
 
     if (isFullscreen) {
         Box(
@@ -319,7 +328,7 @@ fun KaraokeScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Karaoke IEM Stage Player v1.1",
+                        text = "Karaoke IEM Stage Player v1.2",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -359,7 +368,7 @@ fun KaraokeScreen(
                     val syncStatus = when {
                         !telemetry.isPlaying -> "READY · ${formatSignedMs(telemetry.btAdvanceMs)}"
                         telemetry.isPhaseLocked -> "LOCKED (${telemetry.syncErrorMs} ms)"
-                        else -> "SYNCING (${telemetry.syncErrorMs} ms)"
+                        else -> "ALIGNING (${telemetry.syncErrorMs} ms)"
                     }
                     Text(
                         text = syncStatus,
@@ -443,17 +452,30 @@ fun KaraokeScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = if (telemetry.isSplitVerified) {
                             Color(0xFF34D399)
+                        } else if (telemetry.needsSystemMediaSwitchHint) {
+                            Color(0xFFFBBF24)
                         } else {
                             MaterialTheme.colorScheme.onSurfaceVariant
                         }
                     )
 
                     if (telemetry.needsSystemMediaSwitchHint) {
-                        OutlinedButton(
-                            onClick = onOpenSystemMediaOutput,
-                            modifier = Modifier.fillMaxWidth()
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Text("Android locked A2DP to Aux/Speaker — Tap to select BT in Media Output")
+                            OutlinedButton(
+                                onClick = onOpenSystemMediaOutput,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Select BT in Media Output")
+                            }
+                            FilledTonalButton(
+                                onClick = { viewModel.selectSplitMode(SplitRoutingMode.BT_COMM_SCO_BLE) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Use BT Voice IEM")
+                            }
                         }
                     }
                 }
@@ -509,7 +531,7 @@ fun KaraokeScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = "Bluetooth IEM Delay Compensation",
                                 style = MaterialTheme.typography.titleSmall,
@@ -522,7 +544,7 @@ fun KaraokeScreen(
                             )
                         }
                         Text(
-                            text = formatSignedMs(telemetry.btAdvanceMs),
+                            text = formatSignedMs(displayedOffsetMs),
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
@@ -530,8 +552,16 @@ fun KaraokeScreen(
                     }
 
                     Slider(
-                        value = telemetry.btAdvanceMs.toFloat(),
-                        onValueChange = { viewModel.updateManualOffsetMs(it.roundToInt()) },
+                        value = displayedOffsetMs.toFloat(),
+                        onValueChange = {
+                            isDraggingOffset = true
+                            offsetSliderDraft = it
+                        },
+                        onValueChangeFinished = {
+                            val committed = offsetSliderDraft.roundToInt()
+                            isDraggingOffset = false
+                            viewModel.updateManualOffsetMs(committed)
+                        },
                         valueRange = -100f..500f
                     )
 
