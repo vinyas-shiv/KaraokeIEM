@@ -328,7 +328,7 @@ fun KaraokeScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Karaoke IEM Stage Player v1.2",
+                        text = "Karaoke IEM Stage Player v1.3",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -367,8 +367,8 @@ fun KaraokeScreen(
                 ) {
                     val syncStatus = when {
                         !telemetry.isPlaying -> "READY · ${formatSignedMs(telemetry.btAdvanceMs)}"
-                        telemetry.isPhaseLocked -> "LOCKED (${telemetry.syncErrorMs} ms)"
-                        else -> "ALIGNING (${telemetry.syncErrorMs} ms)"
+                        telemetry.isPhaseLocked -> "LOCKED · ${formatSignedMs(telemetry.btAdvanceMs)}"
+                        else -> "GLIDING (${telemetry.syncErrorMs} ms)"
                     }
                     Text(
                         text = syncStatus,
@@ -538,7 +538,7 @@ fun KaraokeScreen(
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = "Advances BT vocal track so IEM, Aux/Speaker & lyrics hit together",
+                                text = "Higher +ms pulls Bluetooth vocals earlier (tap +/-15 or +/-50 ms live!)",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -552,7 +552,7 @@ fun KaraokeScreen(
                     }
 
                     Slider(
-                        value = displayedOffsetMs.toFloat(),
+                        value = displayedOffsetMs.toFloat().coerceIn(-200f, 900f),
                         onValueChange = {
                             isDraggingOffset = true
                             offsetSliderDraft = it
@@ -562,7 +562,7 @@ fun KaraokeScreen(
                             isDraggingOffset = false
                             viewModel.updateManualOffsetMs(committed)
                         },
-                        valueRange = -100f..500f
+                        valueRange = -200f..900f
                     )
 
                     FlowRow(
@@ -570,7 +570,7 @@ fun KaraokeScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        listOf(-15, -5, +5, +15).forEach { step ->
+                        listOf(-50, -15, +15, +50).forEach { step ->
                             OutlinedButton(
                                 onClick = { viewModel.updateManualOffsetMs(telemetry.btAdvanceMs + step) }
                             ) {

@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTimestamp
 import android.media.AudioTrack
@@ -50,15 +51,15 @@ class LatencyAutoCalibrator(context: Context) {
 
     fun saveOffsetForDevice(btDeviceName: String?, usingCommMode: Boolean, offsetMs: Int) {
         if (btDeviceName.isNullOrBlank()) return
-        prefs.edit().putInt(profileKey(btDeviceName, usingCommMode), offsetMs.coerceIn(-250, 600)).apply()
+        prefs.edit().putInt(profileKey(btDeviceName, usingCommMode), offsetMs.coerceIn(-300, 1000)).apply()
     }
 
-    private fun defaultOffset(usingCommMode: Boolean): Int =
+    fun defaultOffset(usingCommMode: Boolean): Int =
         if (usingCommMode) DEFAULT_BT_COMM_OFFSET_MS else DEFAULT_BT_OFFSET_MS
 
     private fun profileKey(name: String, usingCommMode: Boolean): String {
         val modeTag = if (usingCommMode) "comm" else "a2dp"
-        return "bt_${modeTag}_" + name.trim().lowercase().replace(Regex("[^a-z0-9]+"), "_")
+        return "v13_bt_${modeTag}_" + name.trim().lowercase().replace(Regex("[^a-z0-9]+"), "_")
     }
 
     suspend fun probeOsLatencyDeltaMs(
@@ -74,11 +75,16 @@ class LatencyAutoCalibrator(context: Context) {
         val fallback = defaultOffset(sinkConfig.usingCommMode)
 
         if (wiredLat != null && btLat != null && btLat > 20.0) {
-            val delta = (btLat - wiredLat).toInt().coerceIn(0, 500)
+            val adjustedBtLat = if (!sinkConfig.usingCommMode && btLat < 160.0) {
+                btLat + 140.0
+            } else {
+                btLat
+            }
+            val delta = (adjustedBtLat - wiredLat).toInt().coerceIn(80, 750)
             OsProbeResult(
                 deltaMs = delta,
                 wiredLatencyMs = wiredLat.toInt(),
-                btLatencyMs = btLat.toInt(),
+                btLatencyMs = adjustedBtLat.toInt(),
                 usedHardwareTimestamps = true
             )
         } else {
@@ -153,7 +159,7 @@ class LatencyAutoCalibrator(context: Context) {
                     val frameTimeDeltaNs = (frameDelta * 1_000_000_000L) / sampleRate.toLong()
                     val presentationNs = ts.nanoTime + frameTimeDeltaNs
                     val latMs = (presentationNs - nowNs) / 1_000_000.0
-                    if (latMs in 2.0..800.0) {
+                    if (latMs in 2.0..900.0) {
                         measuredMs = latMs
                     }
                 }
@@ -185,8 +191,8 @@ class LatencyAutoCalibrator(context: Context) {
 
         val wiredStartSample = (sampleRate * 0.450).toInt()
         val btStartSample = (sampleRate * 1.150).toInt()
-        val totalPlaySamples = (sampleRate * 1.95).toInt()
-        val totalRecordSamples = (sampleRate * 2.25).toInt()
+        val totalPlaySamples = (sampleRate * 2.15).toInt()
+        val totalRecordSamples = (sampleRate * 2.45).toInt()
 
         val wiredStreamPcm = ShortArray(totalPlaySamples)
         upChirp.copyInto(wiredStreamPcm, destinationOffset = wiredStartSample)
@@ -223,7 +229,7 @@ class LatencyAutoCalibrator(context: Context) {
             return@withContext ChirpCalibrationResult.Failure("Microphone could not be initialized.")
         }
 
-        val builtInMic = findBuiltInPhoneMic()
+        val builtInMic = findBuiltInPhoneMic(recorder)
         if (builtInMic != null) {
             runCatching { recorder.setPreferredDevice(builtInMic) }
         }
@@ -308,7 +314,7 @@ class LatencyAutoCalibrator(context: Context) {
         val btPeak = ChirpDsp.findPeakWithSubsampleInterpolation(
             envelope = btEnv,
             minIndex = (sampleRate * 1.05).toInt(),
-            maxIndex = minOf(btEnv.lastIndex, (sampleRate * 2.15).toInt())
+            maxIndex = minOf(btEnv.lastIndex, (sampleRate * 2.35).toInt())
         )
 
         if (wiredPeak.snrRatio < MIN_CHIRP_SNR || btPeak.snrRatio < MIN_CHIRP_SNR) {
@@ -324,7 +330,7 @@ class LatencyAutoCalibrator(context: Context) {
         val triggerSkewMs = (btFirstWriteNs.get() - wiredFirstWriteNs.get()) / 1_000_000.0
 
         val measuredDeltaMs = (btArrivalMs - wiredArrivalMs) - scheduledGapMs - triggerSkewMs
-        val clampedDelta = ChirpDsp.roundMillis(measuredDeltaMs).coerceIn(-150, 550)
+        val clampedDelta = ChirpDsp.roundMillis(measuredDeltaMs).coerceIn(-250, 900)
 
         saveOffsetForDevice(btDisplayName, sinkConfig.usingCommMode, clampedDelta)
 
@@ -337,9 +343,9 @@ class LatencyAutoCalibrator(context: Context) {
         )
     }
 
-    private fun findBuiltInPhoneMic(): AudioDeviceInfo? {
-        val am = appContext.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-        val inputs = am.getDevices(android.media.AudioManager.GET_DEVICES_INPUTS)
+    private fun findBuiltInPhoneMic(@Suppress("UNUSED_PARAMETER") recorder: AudioRecord): AudioDeviceInfo? {
+        val am = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val inputs = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
         return inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
     }
 
@@ -408,8 +414,8 @@ class LatencyAutoCalibrator(context: Context) {
 
     companion object {
         const val SAMPLE_RATE_HZ = 48_000
-        const val DEFAULT_BT_OFFSET_MS = 180
-        const val DEFAULT_BT_COMM_OFFSET_MS = 115
+        const val DEFAULT_BT_OFFSET_MS = 300
+        const val DEFAULT_BT_COMM_OFFSET_MS = 170
         private const val MIN_CHIRP_SNR = 4.0
     }
 }

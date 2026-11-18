@@ -20,7 +20,10 @@ import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.RenderersFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -41,7 +44,7 @@ enum class SplitRoutingMode(val label: String) {
 
 data class AudioTrackOption(
     val key: String,
-    val groupIndex: Int,
+    val audioGroupOrdinal: Int,
     val trackIndex: Int,
     val displayTitle: String,
     val details: String,
@@ -86,6 +89,67 @@ data class EngineTelemetry(
     val selectedBtTrackKey: String? = null
 )
 
+private class BtLinkKeepAlive {
+    private var track: AudioTrack? = null
+    private var boundDeviceId: Int = -1
+
+    fun ensureActive(btA2dpDevice: AudioDeviceInfo?) {
+        if (btA2dpDevice == null) {
+            stop()
+            return
+        }
+        if (track != null && boundDeviceId == btA2dpDevice.id) {
+            return
+        }
+        stop()
+        runCatching {
+            val sampleRate = 48_000
+            val frameCount = 4_800
+            val pcm = ShortArray(frameCount * 2)
+            for (i in pcm.indices step 2) {
+                val dither: Short = if ((i and 2) == 0) 1 else -1
+                pcm[i] = dither
+                pcm[i + 1] = dither
+            }
+            val built = AudioTrack.Builder()
+                .setAudioAttributes(
+                    PlatformAudioAttributes.Builder()
+                        .setUsage(PlatformAudioAttributes.USAGE_MEDIA)
+                        .setContentType(PlatformAudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(sampleRate)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                        .build()
+                )
+                .setBufferSizeInBytes(pcm.size * 2)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+
+            built.setPreferredDevice(btA2dpDevice)
+            built.setVolume(0.002f)
+            built.write(pcm, 0, pcm.size)
+            built.setLoopPoints(0, frameCount, -1)
+            built.play()
+            track = built
+            boundDeviceId = btA2dpDevice.id
+        }
+    }
+
+    fun stop() {
+        boundDeviceId = -1
+        val old = track
+        track = null
+        if (old != null) {
+            runCatching { old.stop() }
+            runCatching { old.release() }
+        }
+    }
+}
+
 class DualSinkPlayerEngine(
     context: Context,
     private val scope: CoroutineScope
@@ -96,18 +160,31 @@ class DualSinkPlayerEngine(
     private val wiredTrackSelector = DefaultTrackSelector(appContext)
     private val btTrackSelector = DefaultTrackSelector(appContext)
 
+    private val btAudioOnlyRenderersFactory: RenderersFactory = RenderersFactory {
+        handler, videoListener, audioListener, textOutput, metadataOutput ->
+        DefaultRenderersFactory(appContext)
+            .createRenderers(handler, videoListener, audioListener, textOutput, metadataOutput)
+            .filter { it.trackType == C.TRACK_TYPE_AUDIO }
+            .toTypedArray()
+    }
+
     val wiredPlayer: ExoPlayer = ExoPlayer.Builder(appContext)
         .setTrackSelector(wiredTrackSelector)
+        .setLoadControl(buildSmoothLoadControl())
         .build()
 
-    val btPlayer: ExoPlayer = ExoPlayer.Builder(appContext)
+    val btPlayer: ExoPlayer = ExoPlayer.Builder(appContext, btAudioOnlyRenderersFactory)
         .setTrackSelector(btTrackSelector)
+        .setLoadControl(buildSmoothLoadControl())
         .build()
+
+    private val btKeepAlive = BtLinkKeepAlive()
 
     private val _telemetry = MutableStateFlow(EngineTelemetry())
     val telemetry: StateFlow<EngineTelemetry> = _telemetry.asStateFlow()
 
     private var syncLoopJob: Job? = null
+    private var startCueJob: Job? = null
     private var routeProbeJob: Job? = null
     private var tracksAutoAssignedForCurrentMedia = false
 
@@ -117,10 +194,16 @@ class DualSinkPlayerEngine(
     private var lastAppliedSignature: AppliedRouteSignature? = null
     private var lastWiredMedia3Attrs: AudioAttributes? = null
     private var lastBtMedia3Attrs: AudioAttributes? = null
+    private var commModeEngagedAtMs: Long = 0L
 
-    private var settleUntilRealtimeMs: Long = 0L
-    private var currentAppliedBtSpeed: Float = 1.0f
-    private var driftConfirmCount: Int = 0
+    private var isCueingStart = false
+    private var baselineLocked = false
+    private var baselineSamples = DoubleArray(3)
+    private var baselineSampleCount = 0
+    private var baselinePosDeltaMs = 0.0
+    private var pendingManualShiftMs = 0.0
+    private var syncSettleUntilMs = 0L
+    private var currentAppliedBtSpeed = 1.0f
 
     private val initialAudioMode = audioManager.mode
     private val initialAlarmVolume = runCatching {
@@ -176,37 +259,46 @@ class DualSinkPlayerEngine(
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                _telemetry.value = _telemetry.value.copy(isPlaying = isPlaying)
-                if (isPlaying) {
-                    if (!btPlayer.isPlaying && currentBtSink != null) {
-                        alignBtPlayerIfNeeded(maxToleranceMs = 45L)
-                        btPlayer.play()
-                    }
-                } else {
-                    if (btPlayer.isPlaying) {
-                        btPlayer.pause()
-                    }
+                if (!isCueingStart) {
+                    _telemetry.value = _telemetry.value.copy(isPlaying = isPlaying)
                 }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
+                    isCueingStart = false
                     btPlayer.pause()
+                    resetBtSpeedToUnity()
+                    _telemetry.value = _telemetry.value.copy(isPlaying = false, isPhaseLocked = false)
                 }
                 updateDurationAndPosition()
             }
         })
 
-        startGentleSyncLoop()
+        startBaselineSyncLoop()
+    }
+
+    fun suspendKeepAliveForCalibration() {
+        btKeepAlive.stop()
+    }
+
+    fun resumeKeepAliveAfterCalibration() {
+        val cfg = currentActiveSinkConfig()
+        if (!cfg.usingCommMode && currentBtSink != null) {
+            btKeepAlive.ensureActive(cfg.btDevice)
+        }
     }
 
     fun setSplitMode(mode: SplitRoutingMode) {
         if (_telemetry.value.splitMode == mode) return
+        val wasPlaying = wiredPlayer.isPlaying || isCueingStart
+        if (wasPlaying) pause()
         _telemetry.value = _telemetry.value.copy(
             splitMode = mode,
             needsSystemMediaSwitchHint = false
         )
         applyHardwareRoutingPolicy(force = true)
+        if (wasPlaying) play()
     }
 
     fun setRoutedDevices(wiredSink: OutputSinkItem?, btSink: OutputSinkItem?) {
@@ -216,7 +308,7 @@ class DualSinkPlayerEngine(
     }
 
     fun recheckRoutesAsync() {
-        if (!wiredPlayer.isPlaying) {
+        if (!wiredPlayer.isPlaying && !isCueingStart) {
             scheduleOneShotRouteVerification(currentActiveSinkConfig())
         }
     }
@@ -227,7 +319,7 @@ class DualSinkPlayerEngine(
         val useCommForBt = (_telemetry.value.splitMode == SplitRoutingMode.BT_COMM_SCO_BLE) && btItem != null
 
         return if (useCommForBt) {
-            val btDev = btItem?.commDeviceInfo ?: findFallbackBtCommDevice() ?: btItem?.deviceInfo
+            val btDev = resolveMatchingCommDevice(btItem) ?: btItem?.commDeviceInfo ?: btItem?.deviceInfo
             val wiredUsage = if (wiredItem?.deviceInfo?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
                 PlatformAudioAttributes.USAGE_ALARM
             } else {
@@ -273,10 +365,16 @@ class DualSinkPlayerEngine(
         lastAppliedSignature = sig
 
         if (cfg.usingCommMode && cfg.btDevice != null) {
+            btKeepAlive.stop()
             engageBluetoothCommunicationRoute(cfg.btDevice)
-            ensureStreamAudible(AudioManager.STREAM_VOICE_CALL, minFraction = 0.65f)
+            ensureStreamAudible(AudioManager.STREAM_VOICE_CALL, minFraction = 0.70f)
         } else {
             disengageBluetoothCommunicationRoute()
+            if (currentBtSink != null) {
+                btKeepAlive.ensureActive(cfg.btDevice)
+            } else {
+                btKeepAlive.stop()
+            }
         }
 
         if (cfg.wiredUsage == PlatformAudioAttributes.USAGE_ALARM) {
@@ -297,8 +395,7 @@ class DualSinkPlayerEngine(
         }
         btPlayer.setPreferredAudioDevice(cfg.btDevice)
 
-        resetBtSpeedToUnity()
-        settleUntilRealtimeMs = SystemClock.elapsedRealtime() + 1_200L
+        resetBaselineTracking()
 
         val summary = when {
             currentBtSink == null ->
@@ -428,11 +525,29 @@ class DualSinkPlayerEngine(
             .build()
     }
 
+    private fun resolveMatchingCommDevice(btItem: OutputSinkItem?): AudioDeviceInfo? {
+        if (btItem == null) return null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val commCandidates = runCatching { audioManager.availableCommunicationDevices }.getOrDefault(emptyList())
+            btItem.commDeviceInfo?.let { c ->
+                commCandidates.firstOrNull { it.id == c.id }?.let { return it }
+            }
+            commCandidates.firstOrNull {
+                it.productName?.toString() == btItem.name && AudioDeviceRouter.isBluetoothDeviceType(it.type)
+            }?.let { return it }
+            commCandidates.firstOrNull { it.type == 26 }?.let { return it }
+            commCandidates.firstOrNull { AudioDeviceRouter.isBluetoothDeviceType(it.type) }?.let { return it }
+        }
+        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .firstOrNull { it.isSink && it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+    }
+
     @Suppress("DEPRECATION")
     private fun engageBluetoothCommunicationRoute(btCommDevice: AudioDeviceInfo) {
         runCatching {
             if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
                 audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                commModeEngagedAtMs = SystemClock.elapsedRealtime()
             }
             audioManager.isSpeakerphoneOn = false
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -473,16 +588,6 @@ class DualSinkPlayerEngine(
         }
     }
 
-    private fun findFallbackBtCommDevice(): AudioDeviceInfo? {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val comm = runCatching { audioManager.availableCommunicationDevices }.getOrDefault(emptyList())
-            comm.firstOrNull { it.type == 26 }?.let { return it }
-            comm.firstOrNull { AudioDeviceRouter.isBluetoothDeviceType(it.type) }?.let { return it }
-        }
-        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            .firstOrNull { it.isSink && it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-    }
-
     private fun ensureStreamAudible(streamType: Int, minFraction: Float) {
         runCatching {
             val max = audioManager.getStreamMaxVolume(streamType)
@@ -507,12 +612,14 @@ class DualSinkPlayerEngine(
     }
 
     fun loadMkvUri(uri: Uri) {
+        startCueJob?.cancel()
+        isCueingStart = false
         tracksAutoAssignedForCurrentMedia = false
         val item = MediaItem.fromUri(uri)
 
         wiredPlayer.stop()
         btPlayer.stop()
-        resetBtSpeedToUnity()
+        resetBaselineTracking()
 
         wiredPlayer.setMediaItem(item)
         btPlayer.setMediaItem(item)
@@ -521,48 +628,48 @@ class DualSinkPlayerEngine(
         btPlayer.prepare()
 
         _telemetry.value = _telemetry.value.copy(
+            isPlaying = false,
             positionMs = 0L,
             durationMs = 0L,
             audioTracks = emptyList(),
             selectedWiredTrackKey = null,
             selectedBtTrackKey = null,
-            isPhaseLocked = false
+            isPhaseLocked = false,
+            syncErrorMs = 0L
         )
     }
 
     fun play() {
-        routeProbeJob?.cancel()
-        runCatching { audioManager.requestAudioFocus(audioFocusRequest) }
-        applyHardwareRoutingPolicy(force = false)
-        resetBtSpeedToUnity()
-        settleUntilRealtimeMs = SystemClock.elapsedRealtime() + 1_200L
-
-        if (currentBtSink != null) {
-            alignBtPlayerIfNeeded(maxToleranceMs = 25L)
-            btPlayer.play()
-        }
-        wiredPlayer.play()
+        startSynchronizedPlayback(wiredPlayer.currentPosition.coerceAtLeast(0L))
     }
 
     fun pause() {
+        startCueJob?.cancel()
+        isCueingStart = false
         wiredPlayer.pause()
         btPlayer.pause()
-        resetBtSpeedToUnity()
+        resetBaselineTracking()
+        _telemetry.value = _telemetry.value.copy(isPlaying = false, isPhaseLocked = false, syncErrorMs = 0L)
     }
 
     fun togglePlayPause() {
-        if (wiredPlayer.isPlaying) pause() else play()
+        if (wiredPlayer.isPlaying || isCueingStart) pause() else play()
     }
 
     fun seekTo(positionMs: Long) {
         val dur = wiredPlayer.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
         val clamped = positionMs.coerceIn(0L, dur)
-        val btTarget = (clamped + _telemetry.value.btAdvanceMs).coerceIn(0L, dur)
-        resetBtSpeedToUnity()
-        settleUntilRealtimeMs = SystemClock.elapsedRealtime() + 1_200L
-        wiredPlayer.seekTo(clamped)
-        btPlayer.seekTo(btTarget)
         _telemetry.value = _telemetry.value.copy(positionMs = clamped)
+        if (wiredPlayer.isPlaying || isCueingStart) {
+            startSynchronizedPlayback(clamped)
+        } else {
+            resetBaselineTracking()
+            val (wTarget, bTarget) = computeTargetPair(clamped, _telemetry.value.btAdvanceMs, dur)
+            wiredPlayer.seekTo(wTarget)
+            if (currentBtSink != null) {
+                btPlayer.seekTo(bTarget)
+            }
+        }
     }
 
     fun nudgePosition(deltaMs: Long) {
@@ -570,16 +677,98 @@ class DualSinkPlayerEngine(
     }
 
     fun setBtAdvanceMs(offsetMs: Int) {
-        val clamped = offsetMs.coerceIn(-250, 600)
+        val clamped = offsetMs.coerceIn(-300, 1000)
+        val prev = _telemetry.value.btAdvanceMs
+        val delta = clamped - prev
+        if (delta == 0) return
+
         _telemetry.value = _telemetry.value.copy(btAdvanceMs = clamped)
-        if (wiredPlayer.isPlaying && currentBtSink != null) {
-            val dur = wiredPlayer.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
-            val target = (wiredPlayer.currentPosition + clamped).coerceIn(0L, dur)
-            if (abs(btPlayer.currentPosition - target) > 35L) {
-                resetBtSpeedToUnity()
-                settleUntilRealtimeMs = SystemClock.elapsedRealtime() + 1_000L
-                btPlayer.seekTo(target)
+
+        if (wiredPlayer.isPlaying || isCueingStart) {
+            if (currentBtSink == null) return
+            if (abs(delta) > 140 || isCueingStart) {
+                startSynchronizedPlayback(wiredPlayer.currentPosition.coerceAtLeast(0L))
+            } else {
+                if (baselineLocked) {
+                    baselinePosDeltaMs += delta.toDouble()
+                } else {
+                    pendingManualShiftMs += delta.toDouble()
+                }
             }
+        } else if (currentBtSink != null && wiredPlayer.playbackState == Player.STATE_READY) {
+            val dur = wiredPlayer.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
+            val (_, bTarget) = computeTargetPair(wiredPlayer.currentPosition, clamped, dur)
+            btPlayer.seekTo(bTarget)
+        }
+    }
+
+    private fun computeTargetPair(wiredRequestMs: Long, btAdvanceMs: Int, durationMs: Long): Pair<Long, Long> {
+        val wClamped = wiredRequestMs.coerceIn(0L, durationMs)
+        val rawBt = wClamped + btAdvanceMs.toLong()
+        return if (rawBt < 0L) {
+            val shiftedWired = (wClamped - rawBt).coerceIn(0L, durationMs)
+            shiftedWired to 0L
+        } else {
+            wClamped to rawBt.coerceIn(0L, durationMs)
+        }
+    }
+
+    private fun startSynchronizedPlayback(requestedWiredPosMs: Long) {
+        routeProbeJob?.cancel()
+        startCueJob?.cancel()
+        runCatching { audioManager.requestAudioFocus(audioFocusRequest) }
+        applyHardwareRoutingPolicy(force = false)
+
+        isCueingStart = true
+        _telemetry.value = _telemetry.value.copy(isPlaying = true, isPhaseLocked = false)
+
+        startCueJob = scope.launch(Dispatchers.Main) {
+            wiredPlayer.playWhenReady = false
+            btPlayer.playWhenReady = false
+            resetBaselineTracking()
+
+            val cfg = currentActiveSinkConfig()
+            if (cfg.usingCommMode) {
+                val sinceComm = SystemClock.elapsedRealtime() - commModeEngagedAtMs
+                if (sinceComm in 0L..650L) {
+                    delay(650L - sinceComm)
+                }
+            } else if (currentBtSink != null) {
+                btKeepAlive.ensureActive(cfg.btDevice)
+            }
+
+            if (wiredPlayer.playbackState == Player.STATE_IDLE) wiredPlayer.prepare()
+            if (currentBtSink != null && btPlayer.playbackState == Player.STATE_IDLE) btPlayer.prepare()
+
+            val dur = wiredPlayer.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
+            val (wTarget, bTarget) = computeTargetPair(requestedWiredPosMs, _telemetry.value.btAdvanceMs, dur)
+
+            if (abs(wiredPlayer.currentPosition - wTarget) > 20L) {
+                wiredPlayer.seekTo(wTarget)
+            }
+            if (currentBtSink != null && abs(btPlayer.currentPosition - bTarget) > 20L) {
+                btPlayer.seekTo(bTarget)
+            }
+
+            val deadline = SystemClock.elapsedRealtime() + 2_500L
+            while (isActive && SystemClock.elapsedRealtime() < deadline) {
+                val wReady = wiredPlayer.playbackState == Player.STATE_READY
+                val bReady = currentBtSink == null || btPlayer.playbackState == Player.STATE_READY
+                if (wReady && bReady) break
+                delay(12L)
+            }
+
+            if (!isActive) return@launch
+
+            val now = SystemClock.elapsedRealtime()
+            syncSettleUntilMs = now + 2_000L
+            isCueingStart = false
+
+            if (currentBtSink != null) {
+                btPlayer.play()
+            }
+            wiredPlayer.play()
+            _telemetry.value = _telemetry.value.copy(isPlaying = true)
         }
     }
 
@@ -606,114 +795,132 @@ class DualSinkPlayerEngine(
         val option = _telemetry.value.audioTracks.find { it.key == trackKey } ?: return
         applyAudioTrackOverride(wiredPlayer, option, disableVideoAndText = false)
         _telemetry.value = _telemetry.value.copy(selectedWiredTrackKey = option.key)
+        if (wiredPlayer.isPlaying) {
+            startSynchronizedPlayback(wiredPlayer.currentPosition)
+        }
     }
 
     fun selectBtTrack(trackKey: String) {
         val option = _telemetry.value.audioTracks.find { it.key == trackKey } ?: return
         applyAudioTrackOverride(btPlayer, option, disableVideoAndText = true)
-        settleUntilRealtimeMs = SystemClock.elapsedRealtime() + 1_000L
         _telemetry.value = _telemetry.value.copy(selectedBtTrackKey = option.key)
+        if (wiredPlayer.isPlaying) {
+            startSynchronizedPlayback(wiredPlayer.currentPosition)
+        }
     }
 
     fun swapAudioTracks() {
         val currentWired = _telemetry.value.selectedWiredTrackKey ?: return
         val currentBt = _telemetry.value.selectedBtTrackKey ?: return
-        selectWiredTrack(currentBt)
-        selectBtTrack(currentWired)
-    }
-
-    private fun alignBtPlayerIfNeeded(maxToleranceMs: Long) {
-        val dur = wiredPlayer.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
-        val target = (wiredPlayer.currentPosition + _telemetry.value.btAdvanceMs).coerceIn(0L, dur)
-        if (abs(btPlayer.currentPosition - target) > maxToleranceMs) {
-            btPlayer.seekTo(target)
+        val wOpt = _telemetry.value.audioTracks.find { it.key == currentBt } ?: return
+        val bOpt = _telemetry.value.audioTracks.find { it.key == currentWired } ?: return
+        applyAudioTrackOverride(wiredPlayer, wOpt, disableVideoAndText = false)
+        applyAudioTrackOverride(btPlayer, bOpt, disableVideoAndText = true)
+        _telemetry.value = _telemetry.value.copy(
+            selectedWiredTrackKey = wOpt.key,
+            selectedBtTrackKey = bOpt.key
+        )
+        if (wiredPlayer.isPlaying) {
+            startSynchronizedPlayback(wiredPlayer.currentPosition)
         }
     }
 
+    private fun resetBaselineTracking() {
+        baselineLocked = false
+        baselineSampleCount = 0
+        pendingManualShiftMs = 0.0
+        resetBtSpeedToUnity()
+    }
+
     private fun resetBtSpeedToUnity() {
-        driftConfirmCount = 0
         if (currentAppliedBtSpeed != 1.0f || btPlayer.playbackParameters.speed != 1.0f) {
             btPlayer.playbackParameters = PlaybackParameters.DEFAULT
             currentAppliedBtSpeed = 1.0f
         }
     }
 
-    private fun startGentleSyncLoop() {
+    private fun startBaselineSyncLoop() {
         syncLoopJob?.cancel()
         syncLoopJob = scope.launch(Dispatchers.Main) {
-            var uiTick = 0
             while (isActive) {
                 updateDurationAndPosition()
-                uiTick++
-
-                if (uiTick % 3 == 0) {
-                    evaluateSyncEvery750Ms()
+                evaluateBaselineSync()
+                val sleepMs = if (currentAppliedBtSpeed != 1.0f || (!baselineLocked && wiredPlayer.isPlaying)) {
+                    125L
+                } else {
+                    300L
                 }
-
-                delay(250L)
+                delay(sleepMs)
             }
         }
     }
 
-    private fun evaluateSyncEvery750Ms() {
-        if (!wiredPlayer.isPlaying || wiredPlayer.playbackState != Player.STATE_READY || currentBtSink == null) {
-            if (_telemetry.value.isPhaseLocked) {
-                _telemetry.value = _telemetry.value.copy(isPhaseLocked = false, syncErrorMs = 0L)
-            }
+    private fun evaluateBaselineSync() {
+        if (isCueingStart ||
+            !wiredPlayer.isPlaying ||
+            wiredPlayer.playbackState != Player.STATE_READY ||
+            currentBtSink == null
+        ) {
             return
         }
 
-        if (!btPlayer.isPlaying && btPlayer.playbackState == Player.STATE_READY) {
-            btPlayer.play()
-        }
-        if (btPlayer.playbackState != Player.STATE_READY) {
+        if (btPlayer.playbackState != Player.STATE_READY || !btPlayer.isPlaying) {
             return
         }
 
         val now = SystemClock.elapsedRealtime()
-        val dur = wiredPlayer.duration.takeIf { it > 0L } ?: 0L
-        val decision = ChirpDsp.computePllPlaybackSpeed(
-            wiredPosMs = wiredPlayer.currentPosition,
-            btPosMs = btPlayer.currentPosition,
-            targetAdvanceMs = _telemetry.value.btAdvanceMs,
-            durationMs = dur
+        if (now < syncSettleUntilMs) {
+            return
+        }
+
+        val currentDelta = (btPlayer.currentPosition - wiredPlayer.currentPosition).toDouble()
+
+        if (!baselineLocked) {
+            baselineSamples[baselineSampleCount] = currentDelta
+            baselineSampleCount++
+            if (baselineSampleCount >= 3) {
+                val med = ChirpDsp.medianOfThree(
+                    baselineSamples[0],
+                    baselineSamples[1],
+                    baselineSamples[2]
+                )
+                baselinePosDeltaMs = med + pendingManualShiftMs
+                pendingManualShiftMs = 0.0
+                baselineLocked = true
+                _telemetry.value = _telemetry.value.copy(isPhaseLocked = true, syncErrorMs = 0L)
+            }
+            return
+        }
+
+        val gliding = currentAppliedBtSpeed != 1.0f
+        val decision = ChirpDsp.computeBaselineDriftSpeed(
+            currentPosDeltaMs = currentDelta,
+            targetBaselineDeltaMs = baselinePosDeltaMs,
+            currentlyGliding = gliding
         )
 
-        if (now >= settleUntilRealtimeMs) {
-            when {
-                decision.shouldHardSeek -> {
-                    resetBtSpeedToUnity()
-                    settleUntilRealtimeMs = now + 1_200L
-                    btPlayer.seekTo(decision.seekTargetMs)
-                }
+        if (decision.shouldRecueBoth) {
+            startSynchronizedPlayback(wiredPlayer.currentPosition)
+            return
+        }
 
-                currentAppliedBtSpeed != 1.0f -> {
-                    val crossedZero = (currentAppliedBtSpeed > 1.0f && decision.errorMs <= 12L) ||
-                        (currentAppliedBtSpeed < 1.0f && decision.errorMs >= -12L)
-                    if (crossedZero) {
-                        resetBtSpeedToUnity()
-                    }
-                }
+        val crossedTarget = (currentAppliedBtSpeed > 1.0f && decision.driftErrorMs <= 8L) ||
+            (currentAppliedBtSpeed < 1.0f && decision.driftErrorMs >= -8L)
 
-                decision.playbackSpeed != 1.0f -> {
-                    driftConfirmCount++
-                    if (driftConfirmCount >= 2) {
-                        driftConfirmCount = 0
-                        currentAppliedBtSpeed = decision.playbackSpeed
-                        btPlayer.playbackParameters = PlaybackParameters(decision.playbackSpeed, 1.0f)
-                    }
-                }
-
-                else -> {
-                    driftConfirmCount = 0
-                }
+        val nextSpeed = if (crossedTarget) 1.0f else decision.playbackSpeed
+        if (abs(nextSpeed - currentAppliedBtSpeed) > 0.001f) {
+            currentAppliedBtSpeed = nextSpeed
+            btPlayer.playbackParameters = if (nextSpeed == 1.0f) {
+                PlaybackParameters.DEFAULT
+            } else {
+                PlaybackParameters(nextSpeed, 1.0f)
             }
         }
 
-        val locked = abs(decision.errorMs) <= 25L
-        if (_telemetry.value.syncErrorMs != decision.errorMs || _telemetry.value.isPhaseLocked != locked) {
+        val locked = nextSpeed == 1.0f && abs(decision.driftErrorMs) <= 35L
+        if (_telemetry.value.syncErrorMs != decision.driftErrorMs || _telemetry.value.isPhaseLocked != locked) {
             _telemetry.value = _telemetry.value.copy(
-                syncErrorMs = decision.errorMs,
+                syncErrorMs = decision.driftErrorMs,
                 isPhaseLocked = locked
             )
         }
@@ -729,8 +936,9 @@ class DualSinkPlayerEngine(
 
     private fun parseAudioTracks(tracks: Tracks): List<AudioTrackOption> {
         val result = mutableListOf<AudioTrackOption>()
+        var audioGroupOrd = 0
         var audioNumber = 1
-        tracks.groups.forEachIndexed { groupIdx, group ->
+        tracks.groups.forEach { group ->
             if (group.type == C.TRACK_TYPE_AUDIO) {
                 for (trackIdx in 0 until group.length) {
                     val fmt = group.getTrackFormat(trackIdx)
@@ -754,8 +962,8 @@ class DualSinkPlayerEngine(
                     val isVoc = listOf("vocal", "voice", "guide", "orig", "singer", "lead").any { it in lower }
 
                     result += AudioTrackOption(
-                        key = "${groupIdx}_$trackIdx",
-                        groupIndex = groupIdx,
+                        key = "${audioGroupOrd}_$trackIdx",
+                        audioGroupOrdinal = audioGroupOrd,
                         trackIndex = trackIdx,
                         displayTitle = title,
                         details = details,
@@ -764,6 +972,7 @@ class DualSinkPlayerEngine(
                     )
                     audioNumber++
                 }
+                audioGroupOrd++
             }
         }
         return result
@@ -783,12 +992,17 @@ class DualSinkPlayerEngine(
 
         applyAudioTrackOverride(wiredPlayer, instPick, disableVideoAndText = false)
         scope.launch(Dispatchers.Main) {
-            repeat(20) {
-                if (btPlayer.currentTracks.groups.size > vocalPick.groupIndex) {
+            repeat(25) {
+                val btAudioGroups = btPlayer.currentTracks.groups.count { it.type == C.TRACK_TYPE_AUDIO }
+                if (btAudioGroups > vocalPick.audioGroupOrdinal) {
                     applyAudioTrackOverride(btPlayer, vocalPick, disableVideoAndText = true)
+                    if (!wiredPlayer.isPlaying && !isCueingStart && currentBtSink != null) {
+                        val preTarget = _telemetry.value.btAdvanceMs.coerceAtLeast(0).toLong()
+                        if (preTarget > 0L) btPlayer.seekTo(preTarget)
+                    }
                     return@launch
                 }
-                delay(75L)
+                delay(60L)
             }
         }
     }
@@ -798,9 +1012,9 @@ class DualSinkPlayerEngine(
         option: AudioTrackOption,
         disableVideoAndText: Boolean
     ) {
-        val groups = player.currentTracks.groups
-        if (option.groupIndex !in groups.indices) return
-        val mediaGroup = groups[option.groupIndex].mediaTrackGroup
+        val audioGroups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        if (option.audioGroupOrdinal !in audioGroups.indices) return
+        val mediaGroup = audioGroups[option.audioGroupOrdinal].mediaTrackGroup
         if (option.trackIndex !in 0 until mediaGroup.length) return
 
         val builder = player.trackSelectionParameters
@@ -818,7 +1032,9 @@ class DualSinkPlayerEngine(
 
     fun release() {
         syncLoopJob?.cancel()
+        startCueJob?.cancel()
         routeProbeJob?.cancel()
+        btKeepAlive.stop()
         runCatching { audioManager.abandonAudioFocusRequest(audioFocusRequest) }
         wiredPlayer.release()
         btPlayer.release()
@@ -829,5 +1045,18 @@ class DualSinkPlayerEngine(
             }
         }
         runCatching { audioManager.mode = initialAudioMode }
+    }
+
+    companion object {
+        private fun buildSmoothLoadControl(): DefaultLoadControl {
+            return DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                    12_000,
+                    30_000,
+                    400,
+                    800
+                )
+                .build()
+        }
     }
 }

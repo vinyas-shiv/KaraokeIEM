@@ -15,10 +15,9 @@ data class ChirpPeakResult(
 )
 
 data class PllDecision(
-    val shouldHardSeek: Boolean,
-    val seekTargetMs: Long,
+    val shouldRecueBoth: Boolean,
     val playbackSpeed: Float,
-    val errorMs: Long
+    val driftErrorMs: Long
 )
 
 object ChirpDsp {
@@ -145,46 +144,42 @@ object ChirpDsp {
         )
     }
 
-    fun computePllPlaybackSpeed(
-        wiredPosMs: Long,
-        btPosMs: Long,
-        targetAdvanceMs: Int,
-        durationMs: Long
+    fun computeBaselineDriftSpeed(
+        currentPosDeltaMs: Double,
+        targetBaselineDeltaMs: Double,
+        currentlyGliding: Boolean
     ): PllDecision {
-        val rawTarget = wiredPosMs + targetAdvanceMs.toLong()
-        val boundedTarget = if (durationMs > 0L) {
-            rawTarget.coerceIn(0L, durationMs)
-        } else {
-            rawTarget.coerceAtLeast(0L)
-        }
-        val errorMs = boundedTarget - btPosMs
+        val errorMs = (targetBaselineDeltaMs - currentPosDeltaMs).roundToLong()
+        val absErr = abs(errorMs)
 
-        return when {
-            abs(errorMs) > 180L -> PllDecision(
-                shouldHardSeek = true,
-                seekTargetMs = boundedTarget,
+        if (absErr > 450L) {
+            return PllDecision(
+                shouldRecueBoth = true,
                 playbackSpeed = 1.0f,
-                errorMs = errorMs
+                driftErrorMs = errorMs
             )
-            abs(errorMs) <= 25L -> PllDecision(
-                shouldHardSeek = false,
-                seekTargetMs = boundedTarget,
-                playbackSpeed = 1.0f,
-                errorMs = errorMs
-            )
-            errorMs > 0L -> PllDecision(
-shouldHardSeek = false,
-seekTargetMs = boundedTarget,
-playbackSpeed = 1.02f,
-errorMs = errorMs
-)
-else -> PllDecision(
-shouldHardSeek = false,
-seekTargetMs = boundedTarget,
-playbackSpeed = 0.98f,
-errorMs = errorMs
-)
         }
+
+        val stopThreshold = if (currentlyGliding) 8L else 35L
+        if (absErr <= stopThreshold) {
+            return PllDecision(
+                shouldRecueBoth = false,
+                playbackSpeed = 1.0f,
+                driftErrorMs = errorMs
+            )
+        }
+
+        val step = if (absErr <= 90L) 0.03f else 0.05f
+        val speed = if (errorMs > 0L) 1.0f + step else 1.0f - step
+        return PllDecision(
+            shouldRecueBoth = false,
+            playbackSpeed = speed,
+            driftErrorMs = errorMs
+        )
+    }
+
+    fun medianOfThree(a: Double, b: Double, c: Double): Double {
+        return maxOf(minOf(a, b), minOf(maxOf(a, b), c))
     }
 
     fun nextPowerOfTwo(value: Int): Int {
