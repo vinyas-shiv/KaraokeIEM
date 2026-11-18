@@ -6,6 +6,7 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -88,6 +89,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.ui.PlayerView
 import com.vinyas.karaokeiem.audio.AudioTrackOption
 import com.vinyas.karaokeiem.audio.OutputSinkItem
+import com.vinyas.karaokeiem.audio.SplitRoutingMode
 import kotlin.math.roundToInt
 
 private val StageDarkColors = darkColorScheme(
@@ -166,6 +168,9 @@ class MainActivity : ComponentActivity() {
                     onPickMkv = {
                         openMkvLauncher.launch(arrayOf("video/x-matroska", "video/*"))
                     },
+                    onOpenSystemMediaOutput = {
+                        openSystemMediaOutputSwitcher()
+                    },
                     onRequestMicChirpCalibration = {
                         val hasMic = ContextCompat.checkSelfPermission(
                             this,
@@ -182,10 +187,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 101) {
+            viewModel.refreshDevices()
+        }
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         if (intent.action == Intent.ACTION_VIEW) {
             intent.data?.let { viewModel.openMkvFile(it) }
+        }
+    }
+
+    private fun openSystemMediaOutputSwitcher() {
+        val triedPanel = runCatching {
+            startActivity(Intent("com.android.settings.panel.action.MEDIA_OUTPUT"))
+        }.isSuccess
+        if (!triedPanel) {
+            runCatching {
+                startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+            }
         }
     }
 
@@ -210,6 +237,7 @@ fun KaraokeScreen(
     isFullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
     onPickMkv: () -> Unit,
+    onOpenSystemMediaOutput: () -> Unit,
     onRequestMicChirpCalibration: () -> Unit
 ) {
     val telemetry by viewModel.engine.telemetry.collectAsState()
@@ -291,7 +319,7 @@ fun KaraokeScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Karaoke IEM Stage Player",
+                        text = "Karaoke IEM Stage Player v1.1",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -361,38 +389,84 @@ fun KaraokeScreen(
                 onNudge = { viewModel.engine.nudgePosition(it) }
             )
 
-            Row(
+            Card(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(16.dp)
             ) {
-                Text(
-                    text = "Dual Audio Routing & Track Split",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f)
-                )
-                if (telemetry.audioTracks.size >= 2) {
-                    AssistChip(
-                        onClick = { viewModel.engine.swapAudioTracks() },
-                        label = { Text("Swap Tracks") },
-                        leadingIcon = {
-                            Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(18.dp))
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Hardware Split Engine",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (telemetry.audioTracks.size >= 2) {
+                                AssistChip(
+                                    onClick = { viewModel.engine.swapAudioTracks() },
+                                    label = { Text("Swap Tracks") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    }
+                                )
+                                Spacer(Modifier.width(4.dp))
+                            }
+                            IconButton(onClick = { viewModel.refreshDevices() }) {
+                                Icon(Icons.Default.Refresh, contentDescription = "Refresh Audio Devices")
+                            }
+                        }
+                    }
+
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        SplitRoutingMode.entries.forEach { mode ->
+                            FilterChip(
+                                selected = telemetry.splitMode == mode,
+                                onClick = { viewModel.selectSplitMode(mode) },
+                                label = { Text(mode.label) }
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = telemetry.activeSplitSummary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (telemetry.isSplitVerified) {
+                            Color(0xFF34D399)
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
                         }
                     )
-                }
-                IconButton(onClick = { viewModel.refreshDevices() }) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Refresh Audio Devices")
+
+                    if (telemetry.needsSystemMediaSwitchHint) {
+                        OutlinedButton(
+                            onClick = onOpenSystemMediaOutput,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Android locked A2DP to Aux/Speaker — Tap to select BT in Media Output")
+                        }
+                    }
                 }
             }
 
             SinkChannelCard(
-                title = "Wired Output · Instrumental (PA / Backing)",
+                title = "Wired / Speaker · Instrumental (PA / Backing)",
                 accentColor = MaterialTheme.colorScheme.primary,
                 leadingIcon = Icons.Default.Headphones,
+                actualOsRoute = telemetry.wiredActualRoute,
                 devices = wiredDevices,
                 selectedDeviceId = selectedWiredId,
-                emptyDeviceHint = "Plug in USB-C or 3.5mm wired headphones",
+                emptyDeviceHint = "Plug in Aux / USB-C cable or use Phone Speaker",
                 onSelectDevice = { viewModel.selectWiredSink(it) },
                 tracks = telemetry.audioTracks,
                 selectedTrackKey = telemetry.selectedWiredTrackKey,
@@ -407,9 +481,10 @@ fun KaraokeScreen(
                 title = "Bluetooth IEM · Vocal Guide (In-Ear Monitor)",
                 accentColor = MaterialTheme.colorScheme.secondary,
                 leadingIcon = Icons.Default.BluetoothAudio,
+                actualOsRoute = telemetry.btActualRoute,
                 devices = btDevices,
                 selectedDeviceId = selectedBtId,
-                emptyDeviceHint = "Connect Bluetooth A2DP / LE Audio earphones",
+                emptyDeviceHint = "Connect Bluetooth earphones",
                 onSelectDevice = { viewModel.selectBtSink(it) },
                 tracks = telemetry.audioTracks,
                 selectedTrackKey = telemetry.selectedBtTrackKey,
@@ -441,7 +516,7 @@ fun KaraokeScreen(
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = "Advances BT vocal track so IEM, wired music & lyrics hit together",
+                                text = "Advances BT vocal track so IEM, Aux/Speaker & lyrics hit together",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -633,6 +708,7 @@ private fun SinkChannelCard(
     title: String,
     accentColor: Color,
     leadingIcon: ImageVector,
+    actualOsRoute: String,
     devices: List<OutputSinkItem>,
     selectedDeviceId: Int?,
     emptyDeviceHint: String,
@@ -656,14 +732,25 @@ private fun SinkChannelCard(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(leadingIcon, contentDescription = null, tint = accentColor, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(leadingIcon, contentDescription = null, tint = accentColor, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = accentColor
+                    )
+                }
                 Text(
-                    text = title,
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = accentColor
+                    text = "OS: $actualOsRoute",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.tertiary
                 )
             }
 
