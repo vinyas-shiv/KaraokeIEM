@@ -160,27 +160,30 @@ object ChirpDsp {
         val errorMs = boundedTarget - btPosMs
 
         return when {
-            abs(errorMs) > 110L -> PllDecision(
+            abs(errorMs) > 180L -> PllDecision(
                 shouldHardSeek = true,
                 seekTargetMs = boundedTarget,
                 playbackSpeed = 1.0f,
                 errorMs = errorMs
             )
-            abs(errorMs) <= 2L -> PllDecision(
+            abs(errorMs) <= 25L -> PllDecision(
                 shouldHardSeek = false,
                 seekTargetMs = boundedTarget,
                 playbackSpeed = 1.0f,
                 errorMs = errorMs
             )
-            else -> {
-                val trim = (errorMs * 0.0022f).coerceIn(-0.045f, 0.045f)
-                PllDecision(
-                    shouldHardSeek = false,
-                    seekTargetMs = boundedTarget,
-                    playbackSpeed = 1.0f + trim,
-                    errorMs = errorMs
-                )
-            }
+            errorMs > 0L -> PllDecision(
+shouldHardSeek = false,
+seekTargetMs = boundedTarget,
+playbackSpeed = 1.02f,
+errorMs = errorMs
+)
+else -> PllDecision(
+shouldHardSeek = false,
+seekTargetMs = boundedTarget,
+playbackSpeed = 0.98f,
+errorMs = errorMs
+)
         }
     }
 
