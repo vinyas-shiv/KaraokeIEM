@@ -10,6 +10,8 @@ import com.vinyas.karaokeiem.audio.ChirpCalibrationResult
 import com.vinyas.karaokeiem.audio.DualSinkPlayerEngine
 import com.vinyas.karaokeiem.audio.LatencyAutoCalibrator
 import com.vinyas.karaokeiem.audio.OutputSinkItem
+import com.vinyas.karaokeiem.audio.SplitRoutingMode
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -17,7 +19,7 @@ import kotlinx.coroutines.launch
 
 data class CalibrationUiState(
     val isBusy: Boolean = false,
-    val statusBanner: String = "Connect wired headphones + Bluetooth earphones for auto-synced IEM playback.",
+    val statusBanner: String = "Connect Aux/Speaker + Bluetooth earphones for independent split playback.",
     val isError: Boolean = false
 )
 
@@ -39,7 +41,7 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
     private val _calibrationState = MutableStateFlow(CalibrationUiState())
     val calibrationState: StateFlow<CalibrationUiState> = _calibrationState.asStateFlow()
 
-    private var lastAutoProbedBtId: Int? = null
+    private var lastAutoProbedSignature: String? = null
 
     init {
         viewModelScope.launch {
@@ -59,22 +61,7 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
                     _selectedBtId.value = btList.firstOrNull()?.id
                 }
                 applySelectedRoutes()
-
-                val activeBt = currentBtSink()
-                if (activeBt != null && activeBt.id != lastAutoProbedBtId) {
-                    lastAutoProbedBtId = activeBt.id
-                    val saved = calibrator.getSavedOffsetForDevice(activeBt.name)
-                    if (saved != null) {
-                        engine.setBtAdvanceMs(saved)
-                        _calibrationState.value = CalibrationUiState(
-                            isBusy = false,
-                            statusBanner = "Loaded saved chirp profile (${formatSignedMs(saved)}) for ${activeBt.name}.",
-                            isError = false
-                        )
-                    } else {
-                        runOsTimestampAutoProbe()
-                    }
-                }
+                loadOrProbeOffsetForCurrentConfig()
             }
         }
     }
@@ -87,14 +74,12 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
     fun selectBtSink(deviceId: Int) {
         _selectedBtId.value = deviceId
         applySelectedRoutes()
-        val bt = currentBtSink()
-        val saved = calibrator.getSavedOffsetForDevice(bt?.name)
-        if (saved != null && bt != null) {
-            engine.setBtAdvanceMs(saved)
-            _calibrationState.value = CalibrationUiState(
-                statusBanner = "Loaded saved profile (${formatSignedMs(saved)}) for ${bt.name}."
-            )
-        }
+        loadOrProbeOffsetForCurrentConfig()
+    }
+
+    fun selectSplitMode(mode: SplitRoutingMode) {
+        engine.setSplitMode(mode)
+        loadOrProbeOffsetForCurrentConfig()
     }
 
     fun refreshDevices() {
@@ -110,12 +95,32 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateManualOffsetMs(offsetMs: Int) {
         engine.setBtAdvanceMs(offsetMs)
-        calibrator.saveOffsetForDevice(currentBtSink()?.name, offsetMs)
+        val cfg = engine.currentActiveSinkConfig()
+        calibrator.saveOffsetForDevice(currentBtSink()?.name, cfg.usingCommMode, offsetMs)
+    }
+
+    private fun loadOrProbeOffsetForCurrentConfig() {
+        val activeBt = currentBtSink() ?: return
+        val cfg = engine.currentActiveSinkConfig()
+        val sig = "${activeBt.name}_${cfg.usingCommMode}"
+        val saved = calibrator.getSavedOffsetForDevice(activeBt.name, cfg.usingCommMode)
+        if (saved != null) {
+            lastAutoProbedSignature = sig
+            engine.setBtAdvanceMs(saved)
+            val chan = if (cfg.usingCommMode) "IEM Voice" else "A2DP"
+            _calibrationState.value = CalibrationUiState(
+                isBusy = false,
+                statusBanner = "Loaded saved $chan offset (${formatSignedMs(saved)}) for ${activeBt.name}.",
+                isError = false
+            )
+        } else if (sig != lastAutoProbedSignature) {
+            lastAutoProbedSignature = sig
+            runOsTimestampAutoProbe()
+        }
     }
 
     fun runOsTimestampAutoProbe() {
         if (_calibrationState.value.isBusy) return
-        val wired = currentWiredSink()
         val bt = currentBtSink()
         if (bt == null) {
             _calibrationState.value = CalibrationUiState(
@@ -129,16 +134,21 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
         if (wasPlaying) engine.pause()
 
         viewModelScope.launch {
+            engine.applyHardwareRoutingPolicy()
+            val cfg = engine.currentActiveSinkConfig()
             _calibrationState.value = CalibrationUiState(
                 isBusy = true,
-                statusBanner = "Probing OS / AVDTP hardware timestamps for ${bt.name}..."
+                statusBanner = "Probing OS hardware latency for ${bt.name}..."
             )
-            val res = calibrator.probeOsLatencyDeltaMs(wired?.deviceInfo, bt.deviceInfo)
+            if (cfg.usingCommMode) {
+                delay(450L)
+            }
+            val res = calibrator.probeOsLatencyDeltaMs(cfg)
             engine.setBtAdvanceMs(res.deltaMs)
             val modeLabel = if (res.usedHardwareTimestamps) {
-                "OS AVDTP auto-estimate: ${formatSignedMs(res.deltaMs)} (BT ${res.btLatencyMs} ms vs Wired ${res.wiredLatencyMs} ms)."
+                "OS auto-estimate: ${formatSignedMs(res.deltaMs)} (BT ${res.btLatencyMs} ms vs Aux/Spk ${res.wiredLatencyMs} ms)."
             } else {
-                "Applied baseline A2DP offset (${formatSignedMs(res.deltaMs)}). Tap 'Mic Chirp Sync' for +/-1 ms precision."
+                "Applied baseline offset (${formatSignedMs(res.deltaMs)}). Tap 'Mic Chirp Sync' for +/-1 ms precision."
             }
             _calibrationState.value = CalibrationUiState(
                 isBusy = false,
@@ -151,7 +161,6 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
 
     fun runAcousticChirpCalibration() {
         if (_calibrationState.value.isBusy) return
-        val wired = currentWiredSink()
         val bt = currentBtSink()
         if (bt == null) {
             _calibrationState.value = CalibrationUiState(
@@ -165,11 +174,16 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
         if (wasPlaying) engine.pause()
 
         viewModelScope.launch {
+            engine.applyHardwareRoutingPolicy()
+            val cfg = engine.currentActiveSinkConfig()
             _calibrationState.value = CalibrationUiState(
                 isBusy = true,
-                statusBanner = "Hold wired earpiece + BT earbud right by the phone mic (playing 2 chirps)..."
+                statusBanner = "Hold Aux earpiece/speaker + BT earbud right by the bottom phone mic (playing 2 chirps)..."
             )
-            when (val res = calibrator.measureAcousticChirpDeltaMs(wired?.deviceInfo, bt.deviceInfo)) {
+            if (cfg.usingCommMode) {
+                delay(500L)
+            }
+            when (val res = calibrator.measureAcousticChirpDeltaMs(cfg, bt.name)) {
                 is ChirpCalibrationResult.Success -> {
                     engine.setBtAdvanceMs(res.deltaMs)
                     _calibrationState.value = CalibrationUiState(
