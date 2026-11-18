@@ -66,41 +66,37 @@ class ChirpDspTest {
     }
 
     @Test
-    fun `PLL drift controller seeks on large jump, stays 1_0x inside jitter deadband, and gently trims moderate drift`() {
-        val jump = ChirpDsp.computePllPlaybackSpeed(
-            wiredPosMs = 10_000L,
-            btPosMs = 10_000L,
-            targetAdvanceMs = 220,
-            durationMs = 240_000L
+    fun `baseline drift controller cancels OS latency offset and glides smoothly without chopping`() {
+        val steady = ChirpDsp.computeBaselineDriftSpeed(
+            currentPosDeltaMs = 30.0,
+            targetBaselineDeltaMs = 45.0,
+            currentlyGliding = false
         )
-        assertTrue(jump.shouldHardSeek)
-        assertEquals(10_220L, jump.seekTargetMs)
+        assertFalse(steady.shouldRecueBoth)
+        assertEquals(1.0f, steady.playbackSpeed, 1e-5f)
 
-        val moderateLag = ChirpDsp.computePllPlaybackSpeed(
-            wiredPosMs = 10_000L,
-            btPosMs = 10_140L,
-            targetAdvanceMs = 185,
-            durationMs = 240_000L
+        val liveNudge = ChirpDsp.computeBaselineDriftSpeed(
+            currentPosDeltaMs = 45.0,
+            targetBaselineDeltaMs = 95.0,
+            currentlyGliding = false
         )
-        assertFalse(moderateLag.shouldHardSeek)
-        assertEquals(1.02f, moderateLag.playbackSpeed, 1e-5f)
+        assertFalse(liveNudge.shouldRecueBoth)
+        assertEquals(1.03f, liveNudge.playbackSpeed, 1e-5f)
 
-        val moderateAhead = ChirpDsp.computePllPlaybackSpeed(
-            wiredPosMs = 10_000L,
-            btPosMs = 10_230L,
-            targetAdvanceMs = 185,
-            durationMs = 240_000L
+        val settled = ChirpDsp.computeBaselineDriftSpeed(
+            currentPosDeltaMs = 89.0,
+            targetBaselineDeltaMs = 95.0,
+            currentlyGliding = true
         )
-        assertFalse(moderateAhead.shouldHardSeek)
-        assertEquals(0.98f, moderateAhead.playbackSpeed, 1e-5f)
+        assertFalse(settled.shouldRecueBoth)
+        assertEquals(1.0f, settled.playbackSpeed, 1e-5f)
 
-        val locked = ChirpDsp.computePllPlaybackSpeed(
-            wiredPosMs = 10_000L,
-            btPosMs = 10_170L,
-            targetAdvanceMs = 185,
-            durationMs = 240_000L
+        val disconnectJump = ChirpDsp.computeBaselineDriftSpeed(
+            currentPosDeltaMs = -500.0,
+            targetBaselineDeltaMs = 45.0,
+            currentlyGliding = false
         )
-        assertFalse(locked.shouldHardSeek)
-        assertEquals(1.0f, locked.playbackSpeed, 1e-5f)
+        assertTrue(disconnectJump.shouldRecueBoth)
+        assertEquals(60.0, ChirpDsp.medianOfThree(120.0, 40.0, 60.0), 1e-6)
     }
 }
