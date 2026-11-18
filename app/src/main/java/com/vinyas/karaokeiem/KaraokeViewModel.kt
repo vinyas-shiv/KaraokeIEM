@@ -84,6 +84,12 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
 
     fun refreshDevices() {
         deviceRouter.refreshDevices()
+        engine.recheckRoutesAsync()
+    }
+
+    fun onAppResumed() {
+        deviceRouter.refreshDevices()
+        engine.recheckRoutesAsync()
     }
 
     fun openMkvFile(uri: Uri) {
@@ -107,7 +113,7 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
         if (saved != null) {
             lastAutoProbedSignature = sig
             engine.setBtAdvanceMs(saved)
-            val chan = if (cfg.usingCommMode) "IEM Voice" else "A2DP"
+            val chan = if (cfg.usingCommMode) "BT Voice IEM" else "Stereo A2DP"
             _calibrationState.value = CalibrationUiState(
                 isBusy = false,
                 statusBanner = "Loaded saved $chan offset (${formatSignedMs(saved)}) for ${activeBt.name}.",
@@ -134,7 +140,7 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
         if (wasPlaying) engine.pause()
 
         viewModelScope.launch {
-            engine.applyHardwareRoutingPolicy()
+            engine.applyHardwareRoutingPolicy(force = false)
             val cfg = engine.currentActiveSinkConfig()
             _calibrationState.value = CalibrationUiState(
                 isBusy = true,
@@ -174,7 +180,7 @@ class KaraokeViewModel(application: Application) : AndroidViewModel(application)
         if (wasPlaying) engine.pause()
 
         viewModelScope.launch {
-            engine.applyHardwareRoutingPolicy()
+            engine.applyHardwareRoutingPolicy(force = false)
             val cfg = engine.currentActiveSinkConfig()
             _calibrationState.value = CalibrationUiState(
                 isBusy = true,
