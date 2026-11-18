@@ -10,10 +10,20 @@ import kotlin.math.abs
 class ChirpDspTest {
 
     @Test
-    fun chirpMatchedFilterRecoversSimulatedBluetoothLagWithinHalfMs() {
+    fun `orthogonal chirp matched filter recovers simulated 187_5ms Bluetooth lag within 0_5ms`() {
         val sampleRate = 48_000
-        val upChirp = ChirpDsp.generateLinearChirpPcm16(sampleRate, 30.0, 1000.0, 3600.0)
-        val downChirp = ChirpDsp.generateLinearChirpPcm16(sampleRate, 30.0, 4600.0, 2000.0)
+        val upChirp = ChirpDsp.generateLinearChirpPcm16(
+            sampleRate = sampleRate,
+            durationMs = 30.0,
+            fStartHz = 1000.0,
+            fEndHz = 3600.0
+        )
+        val downChirp = ChirpDsp.generateLinearChirpPcm16(
+            sampleRate = sampleRate,
+            durationMs = 30.0,
+            fStartHz = 4600.0,
+            fEndHz = 2000.0
+        )
 
         val upFloat = ChirpDsp.pcm16ToNormalizedFloat(upChirp)
         val downFloat = ChirpDsp.pcm16ToNormalizedFloat(downChirp)
@@ -21,16 +31,20 @@ class ChirpDspTest {
         val wiredScheduledSample = (sampleRate * 0.250).toInt()
         val btScheduledSample = (sampleRate * 0.800).toInt()
 
-        val wiredArrival = wiredScheduledSample + ((16.0 + 12.0) * 48.0).toInt()
-        val btArrival = btScheduledSample + ((203.5 + 12.0) * 48.0).toInt()
+        val simulatedWiredLatencyMs = 16.0
+        val simulatedBtLatencyMs = 203.5
+        val micLatencyMs = 12.0
+
+        val wiredArrivalSample = wiredScheduledSample + ((simulatedWiredLatencyMs + micLatencyMs) * 48.0).toInt()
+        val btArrivalSample = btScheduledSample + ((simulatedBtLatencyMs + micLatencyMs) * 48.0).toInt()
 
         val micCapture = FloatArray(sampleRate * 2)
         for (i in upFloat.indices) {
-            micCapture[wiredArrival + i] += 0.70f * upFloat[i]
-            micCapture[wiredArrival + 240 + i] += 0.18f * upFloat[i]
+            micCapture[wiredArrivalSample + i] += 0.70f * upFloat[i]
+            micCapture[wiredArrivalSample + 240 + i] += 0.18f * upFloat[i]
         }
         for (i in downFloat.indices) {
-            micCapture[btArrival + i] -= 0.65f * downFloat[i]
+            micCapture[btArrivalSample + i] -= 0.65f * downFloat[i]
         }
 
         val wiredEnv = ChirpDsp.analyticMatchedFilterEnvelope(micCapture, upFloat)
@@ -39,25 +53,53 @@ class ChirpDspTest {
         val wPeak = ChirpDsp.findPeakWithSubsampleInterpolation(wiredEnv, 8_000, 30_000)
         val bPeak = ChirpDsp.findPeakWithSubsampleInterpolation(btEnv, 36_000, 80_000)
 
-        assertTrue(wPeak.snrRatio > 8.0)
-        assertTrue(bPeak.snrRatio > 8.0)
+        assertTrue("Wired SNR should be high", wPeak.snrRatio > 8.0)
+        assertTrue("BT SNR should be high even with inverted phase", bPeak.snrRatio > 8.0)
 
         val measuredDeltaMs =
             ChirpDsp.samplesToMillis(bPeak.fractionalIndex - wPeak.fractionalIndex, sampleRate) - 550.0
-        assertTrue(abs(measuredDeltaMs - 187.5) < 0.5)
+
+        assertTrue(
+            "Expected ~187.5 ms delta, got $measuredDeltaMs ms",
+            abs(measuredDeltaMs - 187.5) < 0.5
+        )
     }
 
     @Test
-    fun pllDriftControllerSeeksOnLargeJumpAndTrimsSmoothlyOnSmallDrift() {
-        val jump = ChirpDsp.computePllPlaybackSpeed(10_000L, 10_000L, 185, 240_000L)
+    fun `PLL drift controller seeks on large jump, stays 1_0x inside jitter deadband, and gently trims moderate drift`() {
+        val jump = ChirpDsp.computePllPlaybackSpeed(
+            wiredPosMs = 10_000L,
+            btPosMs = 10_000L,
+            targetAdvanceMs = 220,
+            durationMs = 240_000L
+        )
         assertTrue(jump.shouldHardSeek)
-        assertEquals(10_185L, jump.seekTargetMs)
+        assertEquals(10_220L, jump.seekTargetMs)
 
-        val slightLag = ChirpDsp.computePllPlaybackSpeed(10_000L, 10_165L, 185, 240_000L)
-        assertFalse(slightLag.shouldHardSeek)
-        assertTrue(slightLag.playbackSpeed > 1.0f && slightLag.playbackSpeed <= 1.045f)
+        val moderateLag = ChirpDsp.computePllPlaybackSpeed(
+            wiredPosMs = 10_000L,
+            btPosMs = 10_140L,
+            targetAdvanceMs = 185,
+            durationMs = 240_000L
+        )
+        assertFalse(moderateLag.shouldHardSeek)
+        assertEquals(1.02f, moderateLag.playbackSpeed, 1e-5f)
 
-        val locked = ChirpDsp.computePllPlaybackSpeed(10_000L, 10_184L, 185, 240_000L)
+        val moderateAhead = ChirpDsp.computePllPlaybackSpeed(
+            wiredPosMs = 10_000L,
+            btPosMs = 10_230L,
+            targetAdvanceMs = 185,
+            durationMs = 240_000L
+        )
+        assertFalse(moderateAhead.shouldHardSeek)
+        assertEquals(0.98f, moderateAhead.playbackSpeed, 1e-5f)
+
+        val locked = ChirpDsp.computePllPlaybackSpeed(
+            wiredPosMs = 10_000L,
+            btPosMs = 10_170L,
+            targetAdvanceMs = 185,
+            durationMs = 240_000L
+        )
         assertFalse(locked.shouldHardSeek)
         assertEquals(1.0f, locked.playbackSpeed, 1e-5f)
     }
