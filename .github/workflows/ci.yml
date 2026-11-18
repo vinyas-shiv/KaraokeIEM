@@ -1,0 +1,140 @@
+name: Android CI & Signed APK Release
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Test & Build KaraokeIEM APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Prepare Persistent Signing Keystore
+        id: keystore
+        shell: bash
+        run: |
+          KEYSTORE_FILE="$RUNNER_TEMP/karaoke_ci.p12"
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | tr -d ' \t\r\n' | base64 -d > "$KEYSTORE_FILE"
+            echo "store_file=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+            echo "store_password=${{ secrets.KEYSTORE_PASSWORD }}" >> "$GITHUB_OUTPUT"
+            echo "key_alias=${{ secrets.KEY_ALIAS }}" >> "$GITHUB_OUTPUT"
+            echo "key_password=${{ secrets.KEY_PASSWORD }}" >> "$GITHUB_OUTPUT"
+          else
+            DEFAULT_B64="
+            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
+            "
+            printf '%s' "$DEFAULT_B64" | tr -d ' \t\r\n' | base64 -d > "$KEYSTORE_FILE"
+            echo "store_file=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+            echo "store_password=karaokeiem2026" >> "$GITHUB_OUTPUT"
+            echo "key_alias=karaokeiem" >> "$GITHUB_OUTPUT"
+            echo "key_password=karaokeiem2026" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Unit Tests & Build Signed APK
+        env:
+          SIGNING_STORE_FILE: ${{ steps.keystore.outputs.store_file }}
+          SIGNING_STORE_PASSWORD: ${{ steps.keystore.outputs.store_password }}
+          SIGNING_KEY_ALIAS: ${{ steps.keystore.outputs.key_alias }}
+          SIGNING_KEY_PASSWORD: ${{ steps.keystore.outputs.key_password }}
+        run: |
+          gradle testDebugUnitTest assembleRelease assembleDebug --no-daemon --stacktrace
+          mkdir -p dist
+          cp app/build/outputs/apk/release/*.apk dist/KaraokeIEM-release.apk
+          cp app/build/outputs/apk/debug/*.apk dist/KaraokeIEM-debug.apk
+          REL_TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$REL_TAG" ] && [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            REL_TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [ -n "$REL_TAG" ]; then
+            cp app/build/outputs/apk/release/*.apk "dist/KaraokeIEM-${REL_TAG}.apk"
+          fi
+
+      - name: Upload Signed APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KaraokeIEM-APK
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Attach Signed APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+          files: dist/KaraokeIEM-*.apk
+          generate_release_notes: true
